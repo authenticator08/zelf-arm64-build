@@ -1,0 +1,49 @@
+name: Build zELF ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout zELF
+        uses: actions/checkout@v4
+        with:
+          repository: seb3773/zelf
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            clang \
+            lld \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            make \
+            python3
+
+      - name: Build ARM64
+        run: |
+          make clean || true
+          make \
+            CC=aarch64-linux-gnu-gcc \
+            CXX=aarch64-linux-gnu-g++ \
+            AR=aarch64-linux-gnu-ar \
+            RANLIB=aarch64-linux-gnu-ranlib \
+            OBJCOPY=aarch64-linux-gnu-objcopy \
+            -j2
+
+      - name: Check output
+        run: |
+          file build/zelf
+          ls -lh build/zelf
+
+      - name: Upload ARM64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: zelf-linux-arm64
+          path: build/zelf
