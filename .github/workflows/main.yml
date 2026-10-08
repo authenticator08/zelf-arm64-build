@@ -1,11 +1,21 @@
-name: Build zELF ARM64
+name: zELF ARM64 Smart Build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_JOBS: 1
 
     steps:
       - name: Checkout zELF
@@ -13,37 +23,228 @@ jobs:
         with:
           repository: seb3773/zelf
           submodules: recursive
+          fetch-depth: 1
 
-      - name: Install dependencies
+      - name: Verify native ARM64 runner
+        shell: bash
         run: |
-          sudo apt update
-          sudo apt install -y \
+          set -e
+
+          echo "=== SYSTEM ==="
+          uname -a
+          echo
+          echo "Architecture: $(uname -m)"
+
+          ARCH="$(uname -m)"
+
+          if [ "$ARCH" != "aarch64" ]; then
+            echo "::error::This workflow requires native AArch64/ARM64."
+            echo "Detected: $ARCH"
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -e
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            g++ \
             clang \
             lld \
-            binutils-aarch64-linux-gnu \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
+            binutils \
+            nasm \
+            python3 \
             make \
-            python3
+            git \
+            file
 
-      - name: Build ARM64
+      - name: Show toolchain
+        shell: bash
         run: |
-          make clean || true
+          echo "=== GCC ==="
+          gcc --version | head -n 1
+
+          echo "=== G++ ==="
+          g++ --version | head -n 1
+
+          echo "=== Clang ==="
+          clang --version | head -n 1
+
+          echo "=== LLD ==="
+          ld.lld --version | head -n 1
+
+          echo "=== MAKE ==="
+          make --version | head -n 1
+
+      - name: Clean source tree
+        shell: bash
+        run: |
+          set -e
+
+          make clean 2>/dev/null || true
+
+          rm -rf build
+
+          git status --short || true
+
+      - name: First native ARM64 build
+        id: first_build
+        shell: bash
+        run: |
+          set +e
+
+          echo "=== FIRST BUILD ==="
+
           make \
-            CC=aarch64-linux-gnu-gcc \
-            CXX=aarch64-linux-gnu-g++ \
-            AR=aarch64-linux-gnu-ar \
-            RANLIB=aarch64-linux-gnu-ranlib \
-            OBJCOPY=aarch64-linux-gnu-objcopy \
-            -j2
+            CC=gcc \
+            CXX=g++ \
+            STUBS_J=1 \
+            -j1 2>&1 | tee build-first.log
 
-      - name: Check output
+          STATUS=${PIPESTATUS[0]}
+
+          echo "FIRST_BUILD_STATUS=$STATUS" >> "$GITHUB_ENV"
+
+          exit "$STATUS"
+
+      - name: Smart LZHAM fallback
+        if: failure() && env.FIRST_BUILD_STATUS != ''
+        shell: bash
         run: |
+          set -e
+
+          echo "=== ANALYZING BUILD FAILURE ==="
+
+          if grep -q "__memset_chk" build-first.log; then
+
+            echo
+            echo "[!] LZHAM linker failure detected."
+            echo "[*] Creating a backup of Makefile."
+
+            cp Makefile Makefile.before-lzham-fallback
+
+            python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("Makefile")
+          s = p.read_text()
+
+          # Remove LZHAM from codec-selection lists.
+          s = s.replace(" lzham ", " ")
+
+          # Remove ARM64 LZHAM stub entries.
+          s = re.sub(
+              r"(?m)^[ \t]*stub_lzham_[^\n]*\n",
+              "",
+              s
+          )
+
+          # Remove the SFX LZHAM stub entry.
+          s = re.sub(
+              r"(?m)^[ \t]*stub_sfx_lzham[^\n]*\n",
+              "",
+              s
+          )
+
+          p.write_text(s)
+          PY
+
+            echo
+            echo "=== VERIFY LZHAM STUB REMOVAL ==="
+            grep -n "stub_lzham_\|stub_sfx_lzham" Makefile || true
+
+            echo
+            echo "=== REBUILD AFTER LZHAM FALLBACK ==="
+
+            rm -rf build
+
+            make \
+              CC=gcc \
+              CXX=g++ \
+              STUBS_J=1 \
+              -j1 2>&1 | tee build-fallback.log
+
+          else
+            echo
+            echo "::error::Build failed for a reason other than the known LZHAM linker problem."
+            echo
+            echo "=== LAST 100 LINES ==="
+            tail -n 100 build-first.log
+            exit 1
+          fi
+
+      - name: Verify final binary
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f build/zelf ]; then
+            echo "::error::build/zelf was not produced."
+            exit 1
+          fi
+
+          echo "=== FILE ==="
           file build/zelf
+
+          echo
+          echo "=== SIZE ==="
           ls -lh build/zelf
+
+          echo
+          echo "=== ELF HEADER ==="
+          readelf -h build/zelf | grep -E \
+            "Class:|Machine:|Type:|Entry point address:"
+
+          echo
+          echo "=== ARCHITECTURE CHECK ==="
+
+          if file build/zelf | grep -qi "aarch64"; then
+            echo "ARM64/AArch64 build confirmed."
+          else
+            echo "::error::Final binary is not detected as AArch64."
+            exit 1
+          fi
+
+      - name: Create artifact package
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p artifact
+
+          cp build/zelf artifact/zelf-aarch64
+          chmod +x artifact/zelf-aarch64
+
+          if [ -f build-fallback.log ]; then
+            cp build-fallback.log artifact/
+          elif [ -f build-first.log ]; then
+            cp build-first.log artifact/
+          fi
+
+          tar -C artifact -czf zelf-linux-arm64.tar.gz .
 
       - name: Upload ARM64 binary
         uses: actions/upload-artifact@v4
         with:
           name: zelf-linux-arm64
-          path: build/zelf
+          path: |
+            artifact/zelf-aarch64
+            zelf-linux-arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zelf-build-logs
+          path: |
+            build-first.log
+            build-fallback.log
+            Makefile.before-lzham-fallback
+          if-no-files-found: ignore
